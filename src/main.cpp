@@ -2850,16 +2850,19 @@ void loop() {
             if (okPressed || backPressed) fallbackToAP();
         } else if (!g_wifiIsAP && g_wifiConnectStart) {
             wl_status_t st = WiFi.status();
-            uint32_t elapsed = millis() - g_wifiConnectStart;
-            Serial.printf("[wifi] connecting st=%d elapsed=%lus\n", st, elapsed/1000);
-            bool timedOut = elapsed > 30000UL;
-            bool failed   = false;
-            if (failed || timedOut) {
-                Serial.printf("[wifi] connect fail st=%d timeout=%d\n", st, timedOut);
-                g_wifiConnectFailed = true;
-                g_wifiConnectStart  = 0;
-                g_prefs.remove("wifi_ssid");
-                g_prefs.remove("wifi_pass");
+            if (st == WL_CONNECTED) {
+                g_wifiConnectStart = 0;  // stop timeout once connected
+                g_wifiIP = WiFi.localIP().toString();
+            } else {
+                uint32_t elapsed = millis() - g_wifiConnectStart;
+                Serial.printf("[wifi] connecting st=%d elapsed=%lus\n", st, elapsed/1000);
+                if (elapsed > 30000UL) {
+                    Serial.printf("[wifi] connect timeout st=%d\n", st);
+                    g_wifiConnectFailed = true;
+                    g_wifiConnectStart  = 0;
+                    g_prefs.remove("wifi_ssid");
+                    g_prefs.remove("wifi_pass");
+                }
             }
         }
         if (g_settingsSaved) {

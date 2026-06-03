@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```powershell
 pio run                          # compile only
 pio run -t upload                # compile + flash (closes serial monitor first)
+pio run -t uploadfs              # flash LittleFS filesystem (data/ directory)
 pio device monitor --port COM6 --baud 115200   # serial debug output
 ```
 
@@ -27,7 +28,15 @@ Everything lives in `src/main.cpp` — single-file firmware with these layers:
 
 ### State Machine (`AppState` enum)
 `BOOT → SCANNING → CONNECTING → CONNECTED`  
-Alternative branches: `DEVICE_LIST` (manual select), `ERROR` (connect fail), `POPUP_MENU` / `PROGRAMS` (overlays from any state), `DINO_GAME` / `DINO_GAMEOVER`, `STATE_SETTINGS` (WiFi settings mode).
+Alternative branches:
+- `DEVICE_LIST` — manual BLE device selection after scan
+- `ERROR` — connect failure screen
+- `POPUP_MENU` / `PROGRAMS` — overlays accessible from any state via both-buttons
+- `DINO_GAME` / `DINO_GAMEOVER` — side-scrolling jump game
+- `CAR_GAME` / `CAR_GAMEOVER` — physics-based car driving (OK=throttle, BACK=reverse)
+- `RACING_LOGO` / `RACING_GAME` / `RACING_CRASH` / `RACING_GAMEOVER` — pseudo-3D racer (BACK=left, OK=right)
+- `KBDDRV_MENU` / `KBDDRV_CONFIRM` / `KBDDRV_SENDING` / `KBDDRV_INFO` — XMODEM file transfer to HP 200LX
+- `STATE_SETTINGS` — WiFi settings mode (WiFi-only boot path)
 
 `g_state` drives `loop()` via switch. `g_prevState` used by popup overlay to restore state on dismiss.
 
@@ -66,7 +75,18 @@ Alternative branches: `DEVICE_LIST` (manual select), `ERROR` (connect fail), `PO
 - All render functions are rate-limited (~80ms) and idempotent
 
 ### Programs Menu
-LittleFS stores program files (not yet implemented in this codebase — filesystem mounted but no files in `data/` dir).
+Built-in entries: `< Back`, `Dino Game`, `Car Game`, `3D Racing`, `KBD Driver`. LittleFS files in `data/` appear as additional entries (KBD Driver's own files are hidden from this list). Flash filesystem with `pio run -t uploadfs`.
+
+### KBD Driver / XMODEM Transfer
+`STATE_KBDDRV_MENU` lists 3 sendable files (`KBDSER2.COM`, `LOAD2.BAT`, `RESTORE.BAT`) stored in LittleFS.  
+`STATE_KBDDRV_CONFIRM` shows file size and waits for user to start DataComm XMODEM receive on HP 200LX.  
+`STATE_KBDDRV_SENDING` runs a non-blocking XMODEM state machine (`handleXmodem()`) via `g_xState`. States: `XMDM_WAIT_NAK → XMDM_SEND_BLOCK → XMDM_WAIT_ACK → XMDM_SEND_EOT → XMDM_WAIT_EOT_ACK → XMDM_DONE`. Progress bar shows `g_xSentBlocks / g_xTotalBlocks`. Both-buttons or BACK sends CAN bytes and aborts.  
+XMODEM uses Serial1 (same UART as keyboard forwarding) — do not type during transfer.
+
+### Games
+- **Dino**: fixed-position runner; obstacles scroll right→left; speed ramps with score.
+- **Car**: ring-buffer terrain (`g_carTBuf[512]`), physics with pitch/wheelSpin/gravity; crash on flip (`>1.65 rad`) or landing inverted; procedural difficulty ramp. Explosion animation on crash.
+- **3D Racing**: perspective projection via `racingProjY()` / `racingRoadHalf()` / `racingCenterX()`; 4 opponents, 3 lanes, curve system, roadside scenery (grass/bush/tree/building); off-road = spin penalty. Player car is wireframe 3D model (`kCarVerts[20]`, `kCarEdges[24]`). Hi-score in NVS key `hi_racing`.
 
 ## Key Globals
 

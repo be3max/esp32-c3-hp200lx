@@ -1,102 +1,234 @@
 # ESP32-C3 BLE Keyboard Bridge for HP 200LX
 
-Connects a modern Bluetooth HID keyboard to an HP 200LX palmtop via UART/MAX3232. The ESP32-C3 acts as a BLE central (HID host), receives keystrokes, and forwards them as 2-byte packets over serial.
+Connects a modern Bluetooth HID keyboard to an HP 200LX palmtop via UART/MAX3232. The ESP32-C3 acts as a BLE central (HID host), receives keystrokes, and forwards them as 2-byte packets over serial. Includes OLED UI, mini-games, and an XMODEM file transfer tool for installing the keyboard driver on the HP 200LX.
 
-## Hardware
+---
 
-| Component | Detail |
-|-----------|--------|
-| MCU | ESP32-C3 SuperMini |
-| Display | SSD1306 OLED 128×32, I2C |
-| Serial bridge | MAX3232 TTL↔RS-232 level shifter |
-| Target | HP 200LX palmtop, 9600 8N1 |
+## Features
 
-### Wiring
+- **BLE HID host**: pairs and reconnects to any Bluetooth keyboard (BLE HID/HoG profile)
+- **HP 200LX serial bridge**: forwards keystrokes as 2-byte `[event, keycode]` packets at 9600 8N1
+- **OLED UI**: 128×32 display with scrollable menus, status, key event feedback
+- **Auto-reconnect**: remembers last keyboard by identity address; skips 15 s scan on disconnect
+- **WiFi settings**: built-in web interface for configuring WiFi and viewing device info, accessed via QR code
+- **KBD Driver transfer**: sends `KBDSER2.COM` / `LOAD2.BAT` / `RESTORE.BAT` to HP 200LX via XMODEM
+- **Programs menu**: built-in games plus LittleFS-stored executables
+- **Games**: Dino jump, Car physics, 3D pseudo-3D racing with hi-score saved to NVS
+
+---
+
+## Bill of Materials
+
+| Qty | Component | Notes |
+|-----|-----------|-------|
+| 1 | **ESP32-C3 SuperMini** | Main MCU, USB-C, onboard LED on GPIO8 |
+| 1 | **SSD1306 OLED 128×32** | I2C, 3.3 V, 4-pin (GND/VCC/SCL/SDA) |
+| 1 | **MAX3232 module** | TTL ↔ RS-232 level shifter; 3.3 V compatible; 4× 100 nF caps usually on-board |
+| 1 | **DE-9 female connector** | Connects to HP 200LX serial port (COM1) |
+| 2 | **Tactile pushbutton** | 6×6 mm or similar, to GND |
+| 1 | **USB-C cable / 5 V supply** | Powers the ESP32-C3 |
+| — | **Hookup wire, PCB / perfboard** | For assembly |
+
+> **MAX3232 vs MAX232**: Use MAX3232 (3.3 V logic). MAX232 is 5 V only and will damage the ESP32.
+
+---
+
+## Wiring
 
 ```
-ESP32-C3          OLED SSD1306
-GPIO4  ────────── SDA
-GPIO5  ────────── SCL
-3V3    ────────── VCC
-GND    ────────── GND
+ESP32-C3 SuperMini        SSD1306 OLED 128×32
+GPIO4  (SDA) ──────────── SDA
+GPIO5  (SCL) ──────────── SCL
+3V3          ──────────── VCC
+GND          ──────────── GND
 
-ESP32-C3          MAX3232         HP 200LX
-GPIO21 (TX) ───── T1IN → T1OUT ── RX (DB9 pin 2)
-GPIO20 (RX) ───── R1OUT ← R1IN ── TX (DB9 pin 3)
-GND    ─────────────────────────── GND (DB9 pin 5)
+ESP32-C3 SuperMini        MAX3232 module           HP 200LX DE-9
+GPIO21 (TX1) ──────────── T1IN  →  T1OUT ────────── pin 2  (RX)
+GPIO20 (RX1) ──────────── R1OUT ← R1IN  ────────── pin 3  (TX)
+3V3          ──────────── VCC
+GND          ──────────────────────────────────────  pin 5  (GND)
 
-ESP32-C3
-GPIO9  ── BACK button (to GND)
-GPIO10 ── OK button (to GND)
-GPIO8  ── LED (active LOW)
+ESP32-C3 SuperMini        Buttons
+GPIO9  ── BACK button ── GND   (INPUT_PULLUP, active LOW)
+GPIO10 ── OK   button ── GND   (INPUT_PULLUP, active LOW)
+
+GPIO8  ── onboard LED (active LOW, built into SuperMini)
 ```
+
+### HP 200LX DE-9 pinout (DTE, male on palmtop)
+
+| Pin | Signal | Connect to |
+|-----|--------|-----------|
+| 2 | RX (into HP) | MAX3232 T1OUT |
+| 3 | TX (from HP) | MAX3232 R1IN |
+| 5 | GND | common GND |
+
+The HP 200LX serial port is DB-9 DTE male. Use a DE-9 female connector on your cable.  
+Only RX, TX, and GND are needed — no hardware flow control required at 9600 8N1.
+
+### Assembly notes
+
+- Both buttons connect between their GPIO pin and GND. Internal pull-ups are enabled in firmware — no external resistors needed.
+- The MAX3232 module typically has the four 100 nF charge-pump capacitors on-board. If using a bare MAX3232 IC, add 4× 100 nF between C1+/C1−, C2+/C2−, V+/GND, and V−/GND.
+- Power the MAX3232 from the ESP32-C3's 3V3 pin (not 5 V).
+- Keep the UART wires short. Runs fine up to ~30 cm without shielding.
+
+---
 
 ## UI Controls
 
-- **OK** (GPIO10) — select / confirm / scroll down
-- **BACK** (GPIO9) — back / cancel / scroll up
-- **Both held 300ms** — open system menu from any screen
+| Input | Action |
+|-------|--------|
+| **OK** (GPIO10) | Select / confirm / scroll down in lists |
+| **BACK** (GPIO9) | Back / cancel / scroll up in lists |
+| **Both held 300 ms** | Open system menu from any screen |
+
+---
 
 ## Serial Packet Format
 
-Each key event sent to HP 200LX is 2 bytes:
+Each key event sent to the HP 200LX is exactly 2 bytes:
 
 ```
 [0x01, keycode]  — key down
 [0x02, keycode]  — key up
 ```
 
-Keycodes are USB HID boot keyboard codes. Modifiers (Ctrl, Shift, Alt, etc.) are sent as individual keycodes `0xE0`–`0xE7`.
+Keycodes are USB HID boot keyboard scan codes. Modifier keys (Ctrl, Shift, Alt, Win, etc.) are sent as individual keycodes `0xE0`–`0xE7`.
+
+---
 
 ## BLE Pairing
 
-1. Power on ESP32 — it scans automatically
-2. Put keyboard in pairing mode
-3. Select keyboard from list (or auto-connects if previously paired)
-4. After first pair, reconnects automatically on subsequent boots
+1. Power on the ESP32 — it scans automatically for 15 s
+2. Put your Bluetooth keyboard in pairing mode
+3. Select the keyboard from the discovered device list (OK to select)
+4. Pairing happens automatically; bond is saved to NVS
+5. On subsequent boots the bridge auto-reconnects without showing the list
 
-To forget a keyboard and re-pair: hold both buttons → **Scan for devices**.
+**To forget the keyboard and re-pair:** hold both buttons → select **Scan for devices**.  
+**To re-pair without forgetting:** hold both buttons → **Restart** — the bridge will reconnect on the next scan cycle.
+
+---
+
+## Installing the Keyboard Driver on HP 200LX
+
+The firmware includes a built-in XMODEM file sender that transfers `KBDSER2.COM`, `LOAD2.BAT`, and `RESTORE.BAT` to the HP 200LX over the same serial connection used for keystrokes.
+
+### What the files do
+
+| File | Purpose |
+|------|---------|
+| `KBDSER2.COM` | TSR: reads 2-byte `[event, keycode]` packets from COM1 at 9600 8N1 and injects them into the BIOS keyboard buffer. ~1 KB resident. Flags: `/G` game mode, `/D` debug, `/U` unload |
+| `LOAD2.BAT` | Unloads then reloads the driver. Run from A: drive. `/G` for game mode, `/G /D` with counter |
+| `RESTORE.BAT` | Rewrites `CONFIG.SYS` and `AUTOEXEC.BAT` to auto-load the driver on boot, then reboots the HP 200LX |
+
+Install all three files to the HP 200LX **A: drive** (internal flash — survives battery removal).
+
+### Transfer procedure (XMODEM)
+
+#### On HP 200LX
+
+1. Open **DataComm** (built-in terminal emulator: `Ctrl+Alt+D` from System Manager, or via the Applications menu)
+2. Set port to COM1, 9600 baud, 8N1, no flow control (these are DataComm defaults)
+3. Start a receive: **File → Receive → XMODEM** and enter the destination filename (e.g. `A:\KBDSER2.COM`)
+4. DataComm begins waiting (sends a NAK byte to signal readiness)
+
+#### On the bridge
+
+1. Hold both buttons → **Programs** → **KBD Driver**
+2. Select the file to send (e.g. **Send KBDSER2.COM**)
+3. Confirm the file size shown, then press **OK** to begin
+4. The OLED shows a progress bar with block count
+5. Transfer completes in a few seconds; OLED shows "Done!"
+6. Repeat for `LOAD2.BAT` and `RESTORE.BAT`
+
+#### First-time setup on HP 200LX
+
+After transferring all three files, run `RESTORE.BAT` from the HP 200LX command prompt:
+
+```dos
+A:\RESTORE.BAT
+```
+
+This rewrites `CONFIG.SYS` and `AUTOEXEC.BAT` to auto-load `KBDSER2.COM` on every boot. The palmtop reboots automatically. After reboot, keystrokes from the BLE keyboard appear on the HP 200LX.
+
+> **Note:** The bridge's UART TX is shared between keyboard forwarding and XMODEM. Do not attempt a transfer while keystrokes are being typed.
+
+### Sending your own `.EXE` / `.COM` files
+
+The same XMODEM path works for any file you put in the LittleFS filesystem. To add files:
+
+1. Place files in the `data/` directory of this project
+2. Flash the filesystem: `pio run -t uploadfs`
+3. Files appear in the **Programs** menu (files owned by KBD Driver are hidden there but visible in LittleFS)
+
+To receive on the HP 200LX: use DataComm's **File → Receive → XMODEM** as described above.  
+Alternative: use any XMODEM-capable terminal (HyperTerminal, minicom, TERATERM) connected to the same COM port on a PC — the protocol is standard.
+
+---
+
+## WiFi Settings
+
+A built-in web interface lets you configure WiFi credentials and view the paired keyboard name.
+
+### Access
+
+1. Hold both buttons → **Settings** → OK
+2. Device reboots into WiFi-only mode (BLE is not started — required on ESP32-C3 because BLE and WiFi share one radio)
+3. Creates access point **`HP200LX-Setup`** with an 8-character auto-generated password shown on the OLED
+4. OLED shows a QR code and `192.168.4.1`
+5. Connect a phone or laptop to `HP200LX-Setup`, scan the QR code or open `http://192.168.4.1`
+6. Enter WiFi SSID and password → **Save & Reconnect**
+
+### After saving credentials
+
+- Next time Settings mode starts, the device connects to your network (STA mode) instead of creating an AP
+- OLED shows the network name, assigned IP, and a QR code for direct browser access
+
+### Exit Settings
+
+Press **BACK** — device reboots back to BLE bridge mode. The paired keyboard reconnects automatically.
+
+---
+
+## Programs Menu & Games
+
+Access via: hold both buttons → **Programs**
+
+| Entry | Description |
+|-------|-------------|
+| **Dino Game** | Side-scrolling jump game. OK = jump. Obstacle speed increases with score. |
+| **Car Game** | Physics-based car driving. OK = throttle forward, BACK = reverse. Terrain is procedurally generated with increasing difficulty. Wheelie/flip = crash. Distance is the score. |
+| **3D Racing** | Pseudo-3D perspective racer. BACK = steer left, OK = steer right. 3 lanes, curved road, roadside scenery. Score = opponents overtaken. Hi-score saved to NVS. |
+| **KBD Driver** | XMODEM file transfer tool — see above. |
+| *(LittleFS files)* | Any `.COM`/`.EXE`/other files in `data/` appear here (not yet launched — future feature). |
+
+---
 
 ## Build & Flash
 
 Requires [PlatformIO](https://platformio.org/).
 
 ```powershell
-pio run              # compile
-pio run -t upload    # flash
-pio device monitor --port COM6 --baud 115200   # debug serial
+pio run                                          # compile only
+pio run -t upload                                # compile + flash
+pio run -t uploadfs                              # flash LittleFS filesystem (data/ dir)
+pio device monitor --port COM6 --baud 115200     # serial debug output
 ```
 
-## WiFi Settings Page
+> Close the serial monitor before flashing — the USB CDC port is shared.  
+> Port is COM6 on the development machine; adjust for your system.
 
-A built-in web interface lets you configure WiFi credentials and view device info from any browser on the local network.
-
-### How to use
-
-1. Hold both buttons → **Settings** → OK
-2. Device reboots into WiFi-only mode and creates an access point:
-   - **SSID**: `HP200LX-Setup`
-   - **Password**: `12345678`
-3. OLED shows a QR code and the IP address (`192.168.4.1`)
-4. Connect phone/laptop to `HP200LX-Setup`, scan the QR code or open `http://192.168.4.1`
-5. Enter your home WiFi SSID and password → **Save & Reconnect**
-6. Device reboots; re-open Settings to see STA IP and QR code for direct access
-
-### After WiFi credentials are saved
-
-- Settings mode connects to your network (STA mode) instead of creating an AP
-- OLED shows the network name, assigned IP, and a QR code
-- Access the settings page from any device on the same network
-
-### Exiting Settings
-
-Press **BACK** — device reboots back to normal BLE keyboard bridge mode. The paired keyboard reconnects automatically (bond is preserved).
+---
 
 ## Dependencies
 
-- `h2zero/NimBLE-Arduino` ^1.4.2
-- `adafruit/Adafruit SSD1306` ^2.5.7
-- `adafruit/Adafruit GFX Library` ^1.11.9
-- `ricmoo/QRCode` ^0.0.1
-- LittleFS (built-in, for Programs menu storage)
-- WiFi, WebServer (built-in to ESP32 Arduino SDK)
+| Library | Version |
+|---------|---------|
+| `h2zero/NimBLE-Arduino` | ^1.4.2 |
+| `adafruit/Adafruit SSD1306` | ^2.5.7 |
+| `adafruit/Adafruit GFX Library` | ^1.11.9 |
+| `ricmoo/QRCode` | ^0.0.1 |
+| LittleFS | built-in to ESP32 Arduino SDK |
+| WiFi, WebServer | built-in to ESP32 Arduino SDK |
