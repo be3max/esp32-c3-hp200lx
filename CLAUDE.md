@@ -37,6 +37,7 @@ Alternative branches:
 - `RACING_LOGO` / `RACING_GAME` / `RACING_CRASH` / `RACING_GAMEOVER` — pseudo-3D racer (BACK=left, OK=right)
 - `KBDDRV_MENU` / `KBDDRV_CONFIRM` / `KBDDRV_SENDING` / `KBDDRV_INFO` — XMODEM file transfer to HP 200LX
 - `STATE_SETTINGS` — WiFi settings mode (WiFi-only boot path)
+- `STATE_FILESYNC` — WiFi file manager bridged to HP 200LX via Kermit (WiFi-only boot path)
 
 `g_state` drives `loop()` via switch. `g_prevState` used by popup overlay to restore state on dismiss.
 
@@ -58,6 +59,7 @@ Alternative branches:
 - **Solution: WiFi-only boot path.** Settings popup sets NVS `to_settings=true` and calls `ESP.restart()`. `setup()` detects the flag, skips `NimBLEDevice::init()` entirely, and calls `enterWifiSettings()` directly — WiFi gets a clean PHY with no BLE interference.
 - **ESP32-C3 SuperMini TX power**: at default 19.5 dBm the weak onboard regulator browns out and the beacon never radiates (AP stack reports OK). Fix: `WiFi.setTxPower(WIFI_POWER_8_5dBm)` before `softAP()`.
 - **Never call `WiFi.mode(WIFI_OFF)`** unless WiFi was actually started (`WiFi.getMode() != WIFI_MODE_NULL`). Calling it when WiFi was never initialized also triggers the un-init timeout.
+- **STA connect stalls at `WL_DISCONNECTED` (status 6)**: even in the clean WiFi-only boot, `WiFi.begin()` can hang forever at `st=6` (never retries) because the STA driver carries dirty state from boot init. Fix: `WiFi.disconnect(true); delay(200);` before `WiFi.begin()` to force a clean DHCP/driver reset. See STA branch of `enterWifiSettings()`.
 - **Exit Settings = reboot** (`ESP.restart()`). This is intentional — cleanly returns the radio to BLE without any driver teardown ordering issues. Bond data is preserved (`deinit(false)`).
 
 ### NVS Storage (`Preferences`, namespace `"ble-kbd"`)
@@ -66,6 +68,7 @@ Alternative branches:
 - `wifi_ssid` — saved WiFi SSID for Settings STA mode
 - `wifi_pass` — saved WiFi password for Settings STA mode
 - `to_settings` — bool flag: set before reboot to enter WiFi-only settings boot path
+- `to_filesync` — bool flag: set before reboot to enter WiFi-only File Sync boot path
 - `hi_racing` — 3D Racing high score
 
 ### Display Layout (128×32, text size 1 = 6×8px, 21 chars wide)
@@ -75,13 +78,20 @@ Alternative branches:
 - All render functions are rate-limited (~80ms) and idempotent
 
 ### Programs Menu
-Built-in entries: `< Back`, `Dino Game`, `Car Game`, `3D Racing`, `KBD Driver`. LittleFS files in `data/` appear as additional entries (KBD Driver's own files are hidden from this list). Flash filesystem with `pio run -t uploadfs`.
+Built-in entries: `< Back`, `Dino Game`, `Car Game`, `3D Racing`, `KBD Driver`, `File Sync`. LittleFS files in `data/` appear as additional entries (KBD Driver's own files are hidden from this list). Flash filesystem with `pio run -t uploadfs`.
 
 ### KBD Driver / XMODEM Transfer
 `STATE_KBDDRV_MENU` lists 3 sendable files (`KBDSER2.COM`, `LOAD2.BAT`, `RESTORE.BAT`) stored in LittleFS.  
 `STATE_KBDDRV_CONFIRM` shows file size and waits for user to start DataComm XMODEM receive on HP 200LX.  
 `STATE_KBDDRV_SENDING` runs a non-blocking XMODEM state machine (`handleXmodem()`) via `g_xState`. States: `XMDM_WAIT_NAK → XMDM_SEND_BLOCK → XMDM_WAIT_ACK → XMDM_SEND_EOT → XMDM_WAIT_EOT_ACK → XMDM_DONE`. Progress bar shows `g_xSentBlocks / g_xTotalBlocks`. Both-buttons or BACK sends CAN bytes and aborts.  
 XMODEM uses Serial1 (same UART as keyboard forwarding) — do not type during transfer.
+
+### File Sync (WiFi file manager + Kermit)
+Two-way file management of the HP 200LX from a browser. `Programs → File Sync` sets NVS `to_filesync=true` and reboots into a **WiFi-only boot path** (same clean-radio rationale as Settings — BLE never inited). `enterFileSync()` brings up STA via the shared `wifiStaBegin()` helper (no creds → bounce to Settings AP), starts a `WebServer` file manager on port 80, and creates a `KermitClient(Serial1)`. `renderFileSync()` shows URL/QR/activity; BACK reboots back to BLE.
+
+The HP 200LX side runs **MS-Kermit in SERVER mode** (`kermit` → `SERVER` at 9600 8N1 on COM1) — no custom DOS app. The ESP32 is a Kermit **client** (`src/kermit.{h,cpp}`): short packets, type-1 checksum, control/8-bit/repeat quoting, lock-step ACK/NAK with retry. Ops: `get()` (download, streamed to the HTTP client so files never sit fully in RAM), `put()` (upload, spooled from a LittleFS temp file `/.fsup.tmp`), `remoteDelete()` (generic `E`), `hostCommand()` (type `C` — runs DOS `DIR`/`MD`/`RD`/`REN`).
+
+Web routes in `enterFileSync()`: `/` (HTML), `/api/list` (`DIR` → `fsParseDir()` parses classic DOS output to JSON), `/api/download`, `/api/upload`, `/api/delete`, `/api/mkdir`, `/api/rmdir`, `/api/rename`. The POST routes share the `fsRun()` helper (activity label → op → JSON result). MS-Kermit server lacks native mkdir/rmdir/rename, so those go through `hostCommand` (REMOTE HOST DOS commands). WebServer is synchronous — one Kermit op at a time; 9600 baud makes transfers slow. `kermit.exe` itself can be sent to the HP via the XMODEM KBD Driver path.
 
 ### Games
 - **Dino**: fixed-position runner; obstacles scroll right→left; speed ramps with score.

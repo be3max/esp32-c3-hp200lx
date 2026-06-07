@@ -19,6 +19,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "qrcode.h"
+#include "kermit.h"
+#include <functional>
 
 // ---------------------------------------------------------------------------
 // Hardware configuration
@@ -98,6 +100,11 @@ enum AppState {
     STATE_KBDDRV_SENDING,
     STATE_KBDDRV_INFO,
     STATE_SETTINGS,
+    STATE_FILESYNC_MENU,
+    STATE_FILESYNC_CONFIRM,
+    STATE_FILESYNC_SENDING,
+    STATE_FILESYNC,
+    STATE_FILESYNC_INFO,
 };
 static AppState g_state     = STATE_BOOT;
 static AppState g_prevState = STATE_SCANNING;
@@ -163,8 +170,27 @@ static int    g_kdrvCursor = 0;
 static int    g_kdrvScroll = 0;
 static int    g_kdrvFile   = -1;
 static size_t g_kdrvTotal  = 0;
-static int    g_infoScroll = 0;
-static bool   g_kdrvSending = false;  // true while in KBDDRV_SENDING state
+static int    g_infoScroll   = 0;
+static int    g_fsInfoScroll = 0;
+
+// ---------------------------------------------------------------------------
+// File Sync menu globals
+// ---------------------------------------------------------------------------
+static const char* FS_XFER_FILE  = "/LOADKRMT.BAT";
+static const char* FS_XFER_LABEL = "LOADKRMT.BAT";
+
+static const char* FILESYNC_MENU_ITEMS[] = {
+    "< Back",
+    "Start sync",
+    "Send LOADKRMT.BAT",
+    "Information",
+};
+static const int FILESYNC_MENU_COUNT = 4;
+
+static int    g_fsmCursor = 0;
+static int    g_fsmScroll = 0;
+static size_t g_fsmTotal  = 0;
+static bool   g_xmodemActive = false;  // true while KBDDRV or FILESYNC XMODEM send is running
 
 enum XmodemState {
     XMDM_WAIT_NAK,
@@ -232,6 +258,49 @@ static const char* const INFO_LINES[] = {
     "9600 8N1, COM1.",
 };
 static const int INFO_LINE_COUNT = 29;
+
+static const char* const FILESYNC_INFO_LINES[] = {
+    "=== START SYNC ===",
+    "Reboots ESP32 into",
+    "WiFi mode (BLE off)",
+    "Connects to saved",
+    "WiFi, starts HTTP",
+    "file manager on",
+    "port 80. Open URL",
+    "shown on OLED in",
+    "browser to manage",
+    "HP 200LX files.",
+    "",
+    "=== LOADKRMT.BAT ===",
+    "Sends a .BAT file",
+    "to HP 200LX via",
+    "XMODEM (DataComm).",
+    "Run it on HP 200LX",
+    "to start Kermit in",
+    "SERVER mode auto.",
+    "BAT runs: KERMIT",
+    "-C SET PORT COM1,",
+    "SET SPEED 9600,",
+    "SET FLOW NONE,",
+    "SET FILE TYPE",
+    "BINARY,SERVER",
+    "",
+    "=== MANUAL KERMIT ===",
+    "At HP 200LX prompt:",
+    "  kermit",
+    "Then type:",
+    "  SET PORT COM1",
+    "  SET SPEED 9600",
+    "  SET FLOW NONE",
+    "  SET FILE TYPE",
+    "  BINARY",
+    "  SERVER",
+    "",
+    "BACK=File Sync menu",
+    "OK=scroll down",
+};
+static const int FILESYNC_INFO_LINE_COUNT =
+    sizeof(FILESYNC_INFO_LINES) / sizeof(FILESYNC_INFO_LINES[0]);
 
 // ---------------------------------------------------------------------------
 // Dino game
@@ -625,63 +694,77 @@ static void renderDinoGameOver() {
 }
 
 // ---------------------------------------------------------------------------
-// KBD Driver — render functions
+// Shared XMODEM render helpers (used by KBD Driver and File Sync)
 // ---------------------------------------------------------------------------
-static void renderKbdDrvMenu() {
+static void renderScrollMenu(const char* hdr, const char* const* items,
+                             int count, int scroll, int cursor) {
     if (!g_oledReady) return;
     static uint32_t lastUp = 0;
     if (millis() - lastUp < 80) return;
     lastUp = millis();
 
     dispClear();
-    drawHeader("KBD DRIVER");
+    drawHeader(hdr);
     static const int rows[] = { ROW1, ROW2, ROW3 };
     for (int row = 0; row < 3; row++) {
-        int idx = g_kdrvScroll + row;
-        if (idx >= KBDDRV_MENU_COUNT) break;
-        drawRow(rows[row], KBDDRV_MENU_ITEMS[idx], idx == g_kdrvCursor);
+        int idx = scroll + row;
+        if (idx >= count) break;
+        drawRow(rows[row], items[idx], idx == cursor);
     }
-    drawScrollIndicators(g_kdrvScroll, KBDDRV_MENU_COUNT);
+    drawScrollIndicators(scroll, count);
     g_display.display();
 }
 
-static void renderKbdDrvConfirm() {
+static void renderXmodemConfirm(const char* label, size_t total) {
     if (!g_oledReady) return;
     static uint32_t lastUp = 0;
     if (millis() - lastUp < 80) return;
     lastUp = millis();
 
     dispClear();
-    drawHeader(KBDDRV_LABELS[g_kdrvFile]);
+    drawHeader(label);
     char szBuf[22];
-    snprintf(szBuf, sizeof(szBuf), "%u bytes", (unsigned)g_kdrvTotal);
+    snprintf(szBuf, sizeof(szBuf), "%u bytes", (unsigned)total);
     g_display.setCursor(0, ROW1); g_display.print(szBuf);
     g_display.setCursor(0, ROW2); g_display.print("OK=send  BACK=cancel");
     g_display.setCursor(0, ROW3); g_display.print("Start DataComm rcv!");
     g_display.display();
 }
 
-static void renderKbdDrvSending() {
+static void renderXmodemSending(const char* label) {
     if (!g_oledReady) return;
     static uint32_t lastUp = 0;
     if (millis() - lastUp < 100) return;
     lastUp = millis();
 
     dispClear();
-    drawHeader(KBDDRV_LABELS[g_kdrvFile]);
-
-    // Progress bar with border, fill proportional to blocks sent
+    drawHeader(label);
     g_display.drawRect(0, ROW1, DISP_W, 8, SSD1306_WHITE);
     if (g_xTotalBlocks > 0) {
         int filled = (int)((int64_t)g_xSentBlocks * 126 / g_xTotalBlocks);
         if (filled > 0) g_display.fillRect(1, ROW1 + 1, filled, 6, SSD1306_WHITE);
     }
-
     char buf[22];
     snprintf(buf, sizeof(buf), "blk %d/%d", g_xSentBlocks, g_xTotalBlocks);
     g_display.setCursor(0, ROW2); g_display.print(buf);
     g_display.setCursor(0, ROW3); g_display.print("BACK=stop");
     g_display.display();
+}
+
+// ---------------------------------------------------------------------------
+// KBD Driver — render functions
+// ---------------------------------------------------------------------------
+static void renderKbdDrvMenu() {
+    renderScrollMenu("KBD DRIVER", KBDDRV_MENU_ITEMS, KBDDRV_MENU_COUNT,
+                     g_kdrvScroll, g_kdrvCursor);
+}
+
+static void renderKbdDrvConfirm() {
+    renderXmodemConfirm(KBDDRV_LABELS[g_kdrvFile], g_kdrvTotal);
+}
+
+static void renderKbdDrvSending() {
+    renderXmodemSending(KBDDRV_LABELS[g_kdrvFile]);
 }
 
 static void renderKbdDrvInfo() {
@@ -701,6 +784,41 @@ static void renderKbdDrvInfo() {
     }
     if (g_infoScroll > 0)                         { g_display.setCursor(122, ROW1); g_display.print("^"); }
     if (g_infoScroll + 3 < INFO_LINE_COUNT)        { g_display.setCursor(122, ROW3); g_display.print("v"); }
+    g_display.display();
+}
+
+static void renderFileSyncMenu() {
+    renderScrollMenu("FILE SYNC", FILESYNC_MENU_ITEMS, FILESYNC_MENU_COUNT,
+                     g_fsmScroll, g_fsmCursor);
+}
+
+static void renderFileSyncConfirm() {
+    renderXmodemConfirm(FS_XFER_LABEL, g_fsmTotal);
+}
+
+static void renderFileSyncSending() {
+    renderXmodemSending(FS_XFER_LABEL);
+}
+
+static void renderFileSyncInfo() {
+    if (!g_oledReady) return;
+    static uint32_t lastUp = 0;
+    if (millis() - lastUp < 80) return;
+    lastUp = millis();
+
+    dispClear();
+    drawHeader("FILE SYNC INFO");
+    static const int rows[] = { ROW1, ROW2, ROW3 };
+    for (int r = 0; r < 3; r++) {
+        int idx = g_fsInfoScroll + r;
+        if (idx >= FILESYNC_INFO_LINE_COUNT) break;
+        g_display.setCursor(0, rows[r]);
+        g_display.print(FILESYNC_INFO_LINES[idx]);
+    }
+    if (g_fsInfoScroll > 0)
+        { g_display.setCursor(122, ROW1); g_display.print("^"); }
+    if (g_fsInfoScroll + 3 < FILESYNC_INFO_LINE_COUNT)
+        { g_display.setCursor(122, ROW3); g_display.print("v"); }
     g_display.display();
 }
 
@@ -757,7 +875,7 @@ static void handleXmodem() {
                 g_xSentBlocks++;
                 g_xRetry   = 0;
                 g_xTimeout = millis() + 10000;
-                if ((size_t)g_xSentBlocks * XMODEM_BLOCK >= g_kdrvTotal) {
+                if (g_xSentBlocks >= g_xTotalBlocks) {
                     g_xState = XMDM_SEND_EOT;
                 } else {
                     g_xState = XMDM_SEND_BLOCK;
@@ -2154,6 +2272,24 @@ static void loadOrGenApPass() {
     Serial.printf("[wifi] generated AP pass: %s\n", g_apPass.c_str());
 }
 
+static String jsonEsc(const String& s);   // defined in File Sync section
+
+// Start (or restart) a STA connection. Centralizes the hard-won ESP32-C3
+// quirks: lowered TX power (regulator brownout) and disconnect(true) to clear
+// dirty driver state before begin(). Used by Settings, retry, and File Sync.
+static void wifiStaBegin(const String& ssid, const String& pass) {
+    g_wifiIsAP = false;
+    WiFi.mode(WIFI_STA);
+    delay(100);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    WiFi.disconnect(true);
+    delay(200);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    g_wifiConnectStart = millis();
+    g_wifiIP = "";
+    Serial.printf("[wifi] STA begin SSID=%s\n", ssid.c_str());
+}
+
 static void enterWifiSettings() {
     // If BLE happens to be initialized, fully stop it to free the radio.
     // Normally this runs in the WiFi-only boot path where BLE was never
@@ -2188,14 +2324,7 @@ static void enterWifiSettings() {
             ok, WiFi.getMode(), WiFi.softAPIP().toString().c_str(),
             WiFi.channel(), WiFi.getTxPower());
     } else {
-        g_wifiIsAP = false;
-        WiFi.mode(WIFI_STA);
-        delay(100);
-        WiFi.setTxPower(WIFI_POWER_8_5dBm);  // prevent brownout on weak C3 regulator
-        WiFi.begin(ssid.c_str(), pass.c_str());
-        g_wifiConnectStart = millis();
-        g_wifiIP = "";
-        Serial.printf("[wifi] STA mode, SSID=%s\n", ssid.c_str());
+        wifiStaBegin(ssid, pass);
     }
 
     g_webServer = new WebServer(80);
@@ -2224,10 +2353,8 @@ static void enterWifiSettings() {
         String json = "[";
         for (int i = 0; i < n; i++) {
             if (i > 0) json += ",";
-            String ssid = WiFi.SSID(i);
-            ssid.replace("\\", "\\\\");
-            ssid.replace("\"", "\\\"");
-            json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+            json += "{\"ssid\":\"" + jsonEsc(WiFi.SSID(i)) + "\",\"rssi\":" +
+                    String(WiFi.RSSI(i)) + "}";
         }
         json += "]";
         WiFi.scanDelete();
@@ -2253,10 +2380,17 @@ static void exitWifiSettings() {
     ESP.restart();
 }
 
+static void retrySta() {
+    // Re-attempt STA connect with the same saved creds (no reboot needed).
+    g_wifiConnectFailed = false;
+    wifiStaBegin(g_prefs.getString("wifi_ssid", ""),
+                 g_prefs.getString("wifi_pass", ""));
+}
+
 static void fallbackToAP() {
     // Reboot into clean WiFi-only AP mode — in-place STA->AP mode switch
     // leaves the PHY in a dirty state (same issue as BLE->WiFi switch).
-    Serial.println("[wifi] STA failed -> reboot into AP mode");
+    Serial.println("[wifi] STA reset -> reboot into AP mode");
     g_prefs.remove("wifi_ssid");
     g_prefs.remove("wifi_pass");
     g_prefs.putBool("to_settings", true);
@@ -2293,30 +2427,375 @@ static void renderSettings() {
 
     // Right panel from x=27
     if (g_wifiIsAP) {
-        g_display.setCursor(27, ROW0); g_display.print("HP200LX-Setup");
-        g_display.setCursor(27, ROW1); g_display.print("pw:" + g_apPass);
-        g_display.setCursor(27, ROW2); g_display.print("192.168.4.1");
-        g_display.setCursor(27, ROW3); g_display.print("BACK=exit");
+        g_display.setCursor(30, ROW0); g_display.print("HP200LX-Setup");
+        g_display.setCursor(30, ROW1); g_display.print("pw:" + g_apPass);
+        g_display.setCursor(30, ROW2); g_display.print("192.168.4.1");
+        g_display.setCursor(30, ROW3); g_display.print("OK=info BK=exit");
     } else if (g_wifiConnectFailed) {
-        g_display.setCursor(27, ROW0); g_display.print("Connect failed");
-        g_display.setCursor(27, ROW1); g_display.print("Bad SSID/pass?");
-        g_display.setCursor(27, ROW2); g_display.print("WiFi cleared");
-        g_display.setCursor(27, ROW3); g_display.print("Press any key");
+        g_display.setCursor(30, ROW0); g_display.print("Connect failed");
+        g_display.setCursor(30, ROW1); g_display.print(trunc(g_prefs.getString("wifi_ssid",""),16));
+        g_display.setCursor(30, ROW2); g_display.print("OK=Retry");
+        g_display.setCursor(30, ROW3); g_display.print("BACK=Reset AP");
     } else {
         String ssid = g_prefs.getString("wifi_ssid", "");
-        g_display.setCursor(27, ROW0); g_display.print(trunc(ssid, 16));
+        g_display.setCursor(30, ROW0); g_display.print(trunc(ssid, 16));
         if (WiFi.status() == WL_CONNECTED) {
-            g_display.setCursor(27, ROW1); g_display.print(g_wifiIP);
-            g_display.setCursor(27, ROW2); g_display.print("Settings ready");
+            g_display.setCursor(30, ROW1); g_display.print(g_wifiIP);
+            g_display.setCursor(30, ROW2); g_display.print("Settings ready");
         } else {
             int secsLeft = 30 - (int)((millis() - g_wifiConnectStart) / 1000UL);
             if (secsLeft < 0) secsLeft = 0;
-            g_display.setCursor(27, ROW1);
+            g_display.setCursor(30, ROW1);
             g_display.print("Connecting " + String(secsLeft) + "s");
         }
-        g_display.setCursor(27, ROW3); g_display.print("BACK=exit");
+        g_display.setCursor(30, ROW3); g_display.print("OK=info BK=exit");
     }
 
+    g_display.display();
+}
+
+// ---------------------------------------------------------------------------
+// WiFi File Sync — HTTP file manager bridged to HP 200LX via Kermit
+// ---------------------------------------------------------------------------
+static KermitClient* g_kermit     = nullptr;
+static String        g_fsActivity = "Ready";   // shown on OLED
+static const char*   FS_TMP       = "/.fsup.tmp";
+
+static const char kFileSyncHtml[] PROGMEM = R"html(<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HP200LX Files</title>
+<style>
+body{font-family:sans-serif;max-width:560px;margin:16px auto;padding:0 12px}
+h2{margin:0 0 8px}
+.bar{display:flex;gap:6px;margin:8px 0}
+.bar input{flex:1;padding:6px;border:1px solid #ccc;border-radius:4px}
+button{padding:6px 10px;border:none;border-radius:4px;background:#0078d4;color:#fff;cursor:pointer}
+button.s{background:#666}
+button:hover{filter:brightness(.92)}
+table{width:100%;border-collapse:collapse;font-size:.92em}
+td,th{text-align:left;padding:5px 6px;border-bottom:1px solid #eee}
+td.r{text-align:right;color:#666}
+a{color:#0078d4;text-decoration:none;cursor:pointer}
+.act button{padding:3px 7px;font-size:.85em;margin-left:4px}
+#msg{margin:8px 0;font-size:.9em;color:#0a6}
+.tools{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+.note{color:#999;font-size:.8em}
+</style></head>
+<body>
+<h2>HP 200LX Files</h2>
+<div class="bar">
+  <button class="s" onclick="up()">&#8593; Up</button>
+  <input id="path" value="C:\" onchange="load()">
+  <button onclick="load()">Go</button>
+</div>
+<div id="msg"></div>
+<table id="tbl"><tbody></tbody></table>
+<div class="tools">
+  <button onclick="mkdir()">New Folder</button>
+  <label class="s" style="padding:6px 10px;border-radius:4px;color:#fff;cursor:pointer">
+    Upload<input id="file" type="file" style="display:none" onchange="upload()"></label>
+</div>
+<p class="note">Slow link (9600 baud). One operation at a time. DOS 8.3 names.</p>
+<script>
+var cur="C:\\";
+function j(p){return p.replace(/\\/g,"\\\\");}
+function setMsg(m){document.getElementById('msg').textContent=m;}
+function join(d,n){return d.charAt(d.length-1)=="\\"?d+n:d+"\\"+n;}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+async function load(){
+  cur=document.getElementById('path').value;
+  setMsg('Listing...');
+  try{
+    var r=await fetch('/api/list?path='+encodeURIComponent(cur));
+    var d=await r.json();
+    var tb=document.querySelector('#tbl tbody');tb.innerHTML='';
+    d.sort(function(a,b){return (b.dir-a.dir)||a.name.localeCompare(b.name);});
+    d.forEach(function(e){
+      var tr=document.createElement('tr');
+      var full=join(cur,e.name);
+      if(e.dir){
+        tr.innerHTML='<td>&#128193; <a>'+esc(e.name)+'</a></td><td class=r></td>'+
+          '<td class=act><button class=s onclick="rmdir(\''+j(full)+'\')">del</button></td>';
+        tr.querySelector('a').onclick=function(){document.getElementById('path').value=full;load();};
+      }else{
+        tr.innerHTML='<td>&#128196; '+esc(e.name)+'</td><td class=r>'+e.size+'</td>'+
+          '<td class=act>'+
+          '<button onclick="location=\'/api/download?path='+encodeURIComponent(full)+'\'">get</button>'+
+          '<button class=s onclick="ren(\''+j(full)+'\')">ren</button>'+
+          '<button class=s onclick="del(\''+j(full)+'\')">del</button></td>';
+      }
+      tb.appendChild(tr);
+    });
+    setMsg(d.length+' item(s)');
+  }catch(e){setMsg('Error: '+e);}
+}
+function up(){
+  var p=cur.replace(/\\+$/,'');var i=p.lastIndexOf('\\');
+  if(i>2){p=p.substring(0,i);}else{p=p.substring(0,2)+'\\';}
+  document.getElementById('path').value=p;load();
+}
+async function post(url){setMsg('Working...');var r=await fetch(url,{method:'POST'});
+  var d=await r.json();setMsg(d.msg||(d.ok?'OK':'Failed'));load();return d;}
+function del(p){if(confirm('Delete '+p+'?'))post('/api/delete?path='+encodeURIComponent(p));}
+function rmdir(p){if(confirm('Remove folder '+p+'?'))post('/api/rmdir?path='+encodeURIComponent(p));}
+function mkdir(){var n=prompt('New folder name (8.3):');if(n)post('/api/mkdir?path='+encodeURIComponent(join(cur,n)));}
+function ren(p){var n=prompt('New name (8.3):');if(n)post('/api/rename?from='+encodeURIComponent(p)+'&to='+encodeURIComponent(n));}
+async function upload(){
+  var f=document.getElementById('file').files[0];if(!f)return;
+  setMsg('Uploading '+f.name+' ('+f.size+' B)...');
+  try{
+    var r=await fetch('/api/upload?path='+encodeURIComponent(cur),{method:'POST',body:f});
+    var d=await r.json();setMsg(d.msg||'Uploaded');load();
+  }catch(e){setMsg('Upload error: '+e);}
+}
+load();
+</script>
+</body></html>
+)html";
+
+// strip CR/LF/quotes from a user-supplied DOS path/arg
+static String fsSanitize(const String& s) {
+    String o;
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        if (c == '\r' || c == '\n' || c == '"') continue;
+        o += c;
+    }
+    o.trim();
+    return o;
+}
+
+static String fsBasename(const String& path) {
+    int i = path.lastIndexOf('\\');
+    int j = path.lastIndexOf('/');
+    if (j > i) i = j;
+    return (i >= 0) ? path.substring(i + 1) : path;
+}
+
+static String jsonEsc(const String& s) {
+    String o;
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if (c >= 32)          { o += c; }
+    }
+    return o;
+}
+
+// Parse classic DOS `DIR` output into a JSON array. Real file/dir entries start
+// at column 0; header/summary lines begin with a space, so they are skipped.
+static String fsParseDir(const String& dir) {
+    String json = "[";
+    bool first = true;
+    int start = 0;
+    while (start < (int)dir.length()) {
+        int nl = dir.indexOf('\n', start);
+        String line = (nl < 0) ? dir.substring(start) : dir.substring(start, nl);
+        start = (nl < 0) ? dir.length() : nl + 1;
+        line.replace("\r", "");
+        if (line.length() < 12) continue;
+        char c0 = line[0];
+        bool nameStart = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') ||
+                         (c0 >= '0' && c0 <= '9') || c0 == '_';
+        if (!nameStart) continue;                 // skip Volume/Directory/summary
+        String name = line.substring(0, 8);  name.trim();
+        String ext  = line.substring(8, 11); ext.trim();
+        if (name == "." || name == "..") continue;
+        bool isDir = line.indexOf("<DIR>") >= 0;
+        String full = name;
+        if (ext.length() && !isDir) full += "." + ext;
+        long size = 0;
+        if (!isDir) {
+            // first run of digits after the name/ext columns is the size
+            for (int i = 11; i < (int)line.length(); i++) {
+                if (line[i] >= '0' && line[i] <= '9') {
+                    long v = 0;
+                    while (i < (int)line.length() && line[i] >= '0' && line[i] <= '9')
+                        v = v * 10 + (line[i++] - '0');
+                    size = v; break;
+                }
+            }
+        }
+        if (!first) json += ",";
+        first = false;
+        json += "{\"name\":\"" + jsonEsc(full) + "\",\"dir\":" +
+                (isDir ? "true" : "false") + ",\"size\":" + String(size) + "}";
+    }
+    json += "]";
+    return json;
+}
+
+// --- streaming callbacks -------------------------------------------------
+static bool fsDownloadSink(const uint8_t* data, size_t len, void* ctx) {
+    WebServer* srv = (WebServer*)ctx;
+    srv->sendContent((const char*)data, len);
+    return true;
+}
+static int fsUploadSource(uint8_t* buf, size_t maxLen, void* ctx) {
+    File* f = (File*)ctx;
+    if (!*f) return -1;
+    return f->read(buf, maxLen);
+}
+
+static void fsSendResult(bool ok, const String& detail) {
+    String msg = ok ? "OK" : "Failed";
+    if (detail.length()) msg += ": " + detail;
+    String body = "{\"ok\":" + String(ok ? "true" : "false") +
+                  ",\"msg\":\"" + jsonEsc(msg) + "\"}";
+    g_webServer->send(200, "application/json", body);
+}
+
+// Run a Kermit op for a POST route: show activity, run, report JSON result.
+static void fsRun(const char* label, std::function<bool(String&)> op) {
+    g_fsActivity = label;
+    String out;
+    bool ok = op(out);
+    g_fsActivity = "Ready";
+    fsSendResult(ok, ok ? "" : g_kermit->lastError());
+}
+
+static void enterFileSync() {
+    // No stored WiFi creds -> bounce into AP Settings so the user can enter them.
+    String ssid = g_prefs.getString("wifi_ssid", "");
+    if (ssid.length() == 0) {
+        Serial.println("[filesync] no WiFi creds -> reboot to Settings AP");
+        g_prefs.putBool("to_settings", true);
+        delay(50);
+        ESP.restart();
+    }
+
+    g_wifiConnectFailed = false;
+    wifiStaBegin(ssid, g_prefs.getString("wifi_pass", ""));
+
+    g_kermit = new KermitClient(Serial1);
+    g_webServer = new WebServer(80);
+
+    g_webServer->on("/", HTTP_GET, []() {
+        g_webServer->send_P(200, "text/html", kFileSyncHtml);
+    });
+
+    g_webServer->on("/api/list", HTTP_GET, []() {
+        String path = fsSanitize(g_webServer->arg("path"));
+        g_fsActivity = "DIR";
+        String out;
+        String cmd = "DIR " + path;
+        bool ok = g_kermit->hostCommand(cmd.c_str(), out);
+        g_fsActivity = "Ready";
+        if (!ok) { g_webServer->send(200, "application/json", "[]"); return; }
+        g_webServer->send(200, "application/json", fsParseDir(out));
+    });
+
+    g_webServer->on("/api/download", HTTP_GET, []() {
+        String path = fsSanitize(g_webServer->arg("path"));
+        if (path.length() == 0) { g_webServer->send(400, "text/plain", "no path"); return; }
+        g_fsActivity = "GET";
+        g_webServer->sendHeader("Content-Disposition",
+            "attachment; filename=\"" + fsBasename(path) + "\"");
+        g_webServer->setContentLength(CONTENT_LENGTH_UNKNOWN);
+        g_webServer->send(200, "application/octet-stream", "");
+        g_kermit->get(path.c_str(), fsDownloadSink, g_webServer);
+        g_webServer->sendContent("");   // terminate chunked transfer
+        g_fsActivity = "Ready";
+    });
+
+    // upload: body is the raw file; query "path" = destination directory
+    g_webServer->on("/api/upload", HTTP_POST,
+        []() {   // completion: send temp file to HP via Kermit PUT
+            String dir = fsSanitize(g_webServer->arg("path"));
+            String name = fsBasename(g_webServer->upload().filename);
+            String dest = dir;
+            if (dest.length() && dest[dest.length()-1] != '\\') dest += "\\";
+            dest += name;
+            File f = LittleFS.open(FS_TMP, "r");
+            if (!f) { fsSendResult(false, "temp open"); return; }
+            g_fsActivity = "PUT";
+            bool ok = g_kermit->put(dest.c_str(), fsUploadSource, &f);
+            f.close();
+            LittleFS.remove(FS_TMP);
+            g_fsActivity = "Ready";
+            fsSendResult(ok, ok ? "" : g_kermit->lastError());
+        },
+        []() {   // upload data chunks -> spool to LittleFS temp file
+            HTTPUpload& up = g_webServer->upload();
+            static File s_up;
+            if (up.status == UPLOAD_FILE_START) {
+                s_up = LittleFS.open(FS_TMP, "w");
+            } else if (up.status == UPLOAD_FILE_WRITE) {
+                if (s_up) s_up.write(up.buf, up.currentSize);
+            } else if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+                if (s_up) s_up.close();
+            }
+        });
+
+    g_webServer->on("/api/delete", HTTP_POST, []() {
+        fsRun("DEL", [](String& out) {
+            return g_kermit->remoteDelete(
+                fsSanitize(g_webServer->arg("path")).c_str(), out);
+        });
+    });
+
+    g_webServer->on("/api/mkdir", HTTP_POST, []() {
+        fsRun("MKDIR", [](String& out) {
+            return g_kermit->hostCommand(
+                ("MD " + fsSanitize(g_webServer->arg("path"))).c_str(), out);
+        });
+    });
+
+    g_webServer->on("/api/rmdir", HTTP_POST, []() {
+        fsRun("RMDIR", [](String& out) {
+            return g_kermit->hostCommand(
+                ("RD " + fsSanitize(g_webServer->arg("path"))).c_str(), out);
+        });
+    });
+
+    g_webServer->on("/api/rename", HTTP_POST, []() {
+        fsRun("REN", [](String& out) {
+            String from = fsSanitize(g_webServer->arg("from"));
+            String to   = fsSanitize(g_webServer->arg("to"));   // bare new name
+            return g_kermit->hostCommand(("REN " + from + " " + to).c_str(), out);
+        });
+    });
+
+    g_webServer->begin();
+    g_settingsQRReady = false;
+    g_settingsQRUrl   = "";
+    g_settingsLastRender = 0;
+
+    resetI2CPeripheral();   // guard I2C wedge (same as Settings path)
+    if (g_oledReady) g_display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+}
+
+static void renderFileSync() {
+    if (!g_oledReady) return;
+    if (millis() - g_settingsLastRender < 200) return;
+    g_settingsLastRender = millis();
+
+    if (WiFi.status() == WL_CONNECTED && g_wifiIP.length() == 0)
+        g_wifiIP = WiFi.localIP().toString();
+    String url = g_wifiIP.length() ? ("http://" + g_wifiIP) : "http://0.0.0.0";
+
+    if (!g_settingsQRReady || url != g_settingsQRUrl) {
+        qrcode_initText(&g_settingsQR, g_settingsQRBuf, 2, ECC_LOW, url.c_str());
+        g_settingsQRUrl   = url;
+        g_settingsQRReady = true;
+    }
+
+    dispClear();
+    drawQR(0, 3);
+    g_display.setCursor(30, ROW0); g_display.print("FILE SYNC");
+    if (g_wifiConnectFailed) {
+        g_display.setCursor(30, ROW1); g_display.print("WiFi failed");
+        g_display.setCursor(30, ROW2); g_display.print("BACK=exit");
+    } else if (WiFi.status() == WL_CONNECTED) {
+        g_display.setCursor(30, ROW1); g_display.print(g_wifiIP);
+        g_display.setCursor(30, ROW2); g_display.print(trunc(g_fsActivity, 16));
+        g_display.setCursor(30, ROW3); g_display.print("OK=info BK=exit");
+    } else {
+        int s = 30 - (int)((millis() - g_wifiConnectStart) / 1000UL);
+        if (s < 0) s = 0;
+        g_display.setCursor(30, ROW1); g_display.print("Connecting " + String(s) + "s");
+        g_display.setCursor(30, ROW3); g_display.print("OK=info BK=exit");
+    }
     g_display.display();
 }
 
@@ -2347,6 +2826,18 @@ void setup() {
         g_oledReady = g_display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
         enterWifiSettings();       // BLE never inited; guarded inside
         g_state = STATE_SETTINGS;
+        return;
+    }
+
+    // WiFi File Sync boot path: same clean-radio rationale as Settings. BLE is
+    // skipped; WiFi STA + HTTP file manager bridges to HP 200LX via Kermit.
+    if (g_prefs.getBool("to_filesync", false)) {
+        g_prefs.putBool("to_filesync", false);
+        Serial.println("[boot] WiFi file-sync mode (BLE skipped)");
+        resetI2CPeripheral();
+        g_oledReady = g_display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+        enterFileSync();
+        g_state = STATE_FILESYNC;
         return;
     }
 
@@ -2406,21 +2897,25 @@ void loop() {
     bool okPressed   = btnPressed(BTN_OK,   g_btnOkPrev,   g_btnOkLast,   both || g_bothSince > 0);
     bool backPressed = btnPressed(BTN_BACK, g_btnBackPrev, g_btnBackLast, both || g_bothSince > 0);
 
-    // If both-button fires while a transfer is running, abort it cleanly
-    if (both && g_kdrvSending) {
-        g_kdrvSending = false;
+    // If both-button fires while a transfer is running, abort it cleanly.
+    // Also redirect g_state to the corresponding menu so g_prevState lands there
+    // (not on the dead SENDING state) when the popup is dismissed.
+    if (both && g_xmodemActive) {
+        g_xmodemActive = false;
         uint8_t can = XMODEM_CAN;
         Serial1.write(&can, 1);
         Serial1.write(&can, 1);
         g_xFile.close();
+        g_state = (g_state == STATE_FILESYNC_SENDING) ? STATE_FILESYNC_MENU
+                                                       : STATE_KBDDRV_MENU;
     }
 
     // Both buttons held: toggle system popup from any state
     if (both) {
         if (g_state == STATE_POPUP_MENU || g_state == STATE_PROGRAMS) {
             g_state = g_prevState;
-        } else if (g_state == STATE_SETTINGS) {
-            exitWifiSettings();
+        } else if (g_state == STATE_SETTINGS || g_state == STATE_FILESYNC) {
+            exitWifiSettings();   // reboots back into BLE mode
             g_state = g_prevState;
         } else {
             g_prevState   = g_state;
@@ -2591,8 +3086,8 @@ void loop() {
 
     // ---- Programs --------------------------------------------------------
     case STATE_PROGRAMS: {
-        static const char* kBuiltins[] = { "< Back", "Dino Game", "Car Game", "3D Racing", "KBD Driver" };
-        static const int   kBCount     = 5;
+        static const char* kBuiltins[] = { "< Back", "Dino Game", "Car Game", "3D Racing", "KBD Driver", "File Sync" };
+        static const int   kBCount     = 6;
         static String  fsNames[16];
         static int     fsCount     = 0;
         static bool    needRefresh = true;
@@ -2604,12 +3099,15 @@ void loop() {
             while (f && fsCount < 16) {
                 if (!f.isDirectory()) {
                     String nm = String(f.name());
-                    // Hide files owned by KBD Driver program
-                    bool hide = false;
-                    for (auto* kf : KBDDRV_FILES) {
-                        String k = String(kf);
-                        if (k.startsWith("/")) k = k.substring(1);
-                        if (nm.equalsIgnoreCase(k)) { hide = true; break; }
+                    // Hide internal utility files (KBD Driver + File Sync)
+                    bool hide = nm.equalsIgnoreCase(
+                        String(FS_XFER_FILE).substring(1));   // LOADKRMT.BAT
+                    if (!hide) {
+                        for (auto* kf : KBDDRV_FILES) {
+                            String k = String(kf);
+                            if (k.startsWith("/")) k = k.substring(1);
+                            if (nm.equalsIgnoreCase(k)) { hide = true; break; }
+                        }
                     }
                     if (!hide) fsNames[fsCount++] = nm;
                 }
@@ -2660,6 +3158,10 @@ void loop() {
                 g_kdrvCursor = 0;
                 g_kdrvScroll = 0;
                 g_state      = STATE_KBDDRV_MENU;
+            } else if (g_progCursor == 5) {
+                g_fsmCursor = 0;
+                g_fsmScroll = 0;
+                g_state = STATE_FILESYNC_MENU;
             }
         }
         break;
@@ -2792,7 +3294,7 @@ void loop() {
             g_xRetry       = 0;
             g_xState       = XMDM_WAIT_NAK;
             g_xTimeout     = millis() + 30000;
-            g_kdrvSending  = true;
+            g_xmodemActive  = true;
             g_state        = STATE_KBDDRV_SENDING;
         }
         break;
@@ -2807,7 +3309,7 @@ void loop() {
             Serial1.write(&can, 1);
             Serial1.write(&can, 1);
             g_xFile.close();
-            g_kdrvSending = false;
+            g_xmodemActive = false;
             g_state       = STATE_KBDDRV_MENU;
             break;
         }
@@ -2828,7 +3330,7 @@ void loop() {
             }
             if (millis() >= s_msgUntil) {
                 s_msgShown    = false;
-                g_kdrvSending = false;
+                g_xmodemActive = false;
                 g_state       = STATE_KBDDRV_MENU;
             }
         }
@@ -2847,7 +3349,8 @@ void loop() {
         renderSettings();
         if (g_webServer) g_webServer->handleClient();
         if (g_wifiConnectFailed) {
-            if (okPressed || backPressed) fallbackToAP();
+            if (okPressed)        retrySta();       // keep creds, connect again
+            else if (backPressed) fallbackToAP();    // wipe creds, reboot to AP
         } else if (!g_wifiIsAP && g_wifiConnectStart) {
             wl_status_t st = WiFi.status();
             if (st == WL_CONNECTED) {
@@ -2858,10 +3361,8 @@ void loop() {
                 Serial.printf("[wifi] connecting st=%d elapsed=%lus\n", st, elapsed/1000);
                 if (elapsed > 30000UL) {
                     Serial.printf("[wifi] connect timeout st=%d\n", st);
-                    g_wifiConnectFailed = true;
+                    g_wifiConnectFailed = true;   // creds kept; user picks retry/reset
                     g_wifiConnectStart  = 0;
-                    g_prefs.remove("wifi_ssid");
-                    g_prefs.remove("wifi_pass");
                 }
             }
         }
@@ -2874,6 +3375,118 @@ void loop() {
         if (!g_wifiConnectFailed && backPressed) exitWifiSettings();   // reboots
         break;
     }
+
+    // ---- File Sync menu -----------------------------------------------------
+    case STATE_FILESYNC_MENU:
+        if (g_fsmCursor < g_fsmScroll)      g_fsmScroll = g_fsmCursor;
+        if (g_fsmCursor >= g_fsmScroll + 3) g_fsmScroll = g_fsmCursor - 2;
+        if (g_fsmScroll < 0)                 g_fsmScroll = 0;
+        if (g_fsmScroll + 3 > FILESYNC_MENU_COUNT)
+            g_fsmScroll = max(0, FILESYNC_MENU_COUNT - 3);
+
+        renderFileSyncMenu();
+
+        if (backPressed) g_fsmCursor = (g_fsmCursor + 1) % FILESYNC_MENU_COUNT;
+        if (okPressed) {
+            if (g_fsmCursor == 0) {
+                g_state = STATE_PROGRAMS;
+            } else if (g_fsmCursor == 1) {
+                g_prefs.putBool("to_filesync", true);
+                delay(50);
+                ESP.restart();
+            } else if (g_fsmCursor == 2) {
+                File f = LittleFS.open(FS_XFER_FILE);
+                g_fsmTotal = f ? f.size() : 0;
+                if (f) f.close();
+                g_state = STATE_FILESYNC_CONFIRM;
+            } else if (g_fsmCursor == 3) {
+                g_fsInfoScroll = 0;
+                g_state = STATE_FILESYNC_INFO;
+            }
+        }
+        break;
+
+    // ---- File Sync confirm XMODEM send --------------------------------------
+    case STATE_FILESYNC_CONFIRM:
+        renderFileSyncConfirm();
+        if (backPressed) g_state = STATE_FILESYNC_MENU;
+        if (okPressed) {
+            g_xFile = LittleFS.open(FS_XFER_FILE);
+            if (!g_xFile) { g_state = STATE_FILESYNC_MENU; break; }
+            g_xTotalBlocks = (g_fsmTotal + XMODEM_BLOCK - 1) / XMODEM_BLOCK;
+            g_xSentBlocks  = 0;
+            g_xBlockNum    = 1;
+            g_xRetry       = 0;
+            g_xState       = XMDM_WAIT_NAK;
+            g_xTimeout     = millis() + 30000;
+            g_xmodemActive  = true;
+            g_state        = STATE_FILESYNC_SENDING;
+        }
+        break;
+
+    // ---- File Sync XMODEM sending -------------------------------------------
+    case STATE_FILESYNC_SENDING: {
+        handleXmodem();
+        renderFileSyncSending();
+
+        if (backPressed) {
+            uint8_t can = XMODEM_CAN;
+            Serial1.write(&can, 1);
+            Serial1.write(&can, 1);
+            g_xFile.close();
+            g_xmodemActive = false;
+            g_state       = STATE_FILESYNC_MENU;
+            break;
+        }
+
+        if (g_xState == XMDM_DONE || g_xState == XMDM_ERROR) {
+            static uint32_t s_msgUntil = 0;
+            static bool     s_msgShown = false;
+            if (!s_msgShown) {
+                s_msgShown = true;
+                s_msgUntil = millis() + (g_xState == XMDM_DONE ? 1500 : 2000);
+                if (g_oledReady) {
+                    dispClear();
+                    drawHeader(FS_XFER_LABEL);
+                    g_display.setCursor(20, ROW2);
+                    g_display.print(g_xState == XMDM_DONE ? "Done!" : "XMODEM error");
+                    g_display.display();
+                }
+            }
+            if (millis() >= s_msgUntil) {
+                s_msgShown    = false;
+                g_xmodemActive = false;
+                g_state       = STATE_FILESYNC_MENU;
+            }
+        }
+        break;
+    }
+
+    // ---- File Sync WiFi screen -----------------------------------------------
+    case STATE_FILESYNC: {
+        renderFileSync();
+        if (g_webServer) g_webServer->handleClient();
+        if (g_wifiConnectStart) {
+            wl_status_t st = WiFi.status();
+            if (st == WL_CONNECTED) {
+                g_wifiConnectStart = 0;
+                g_wifiIP = WiFi.localIP().toString();
+            } else if (millis() - g_wifiConnectStart > 30000UL) {
+                g_wifiConnectFailed = true;
+                g_wifiConnectStart  = 0;
+            }
+        }
+        if (okPressed)   { g_fsInfoScroll = 0; g_state = STATE_FILESYNC_INFO; }
+        if (backPressed) exitWifiSettings();   // reboots back into BLE mode
+        break;
+    }
+
+    case STATE_FILESYNC_INFO:
+        renderFileSyncInfo();
+        if (okPressed)   g_fsInfoScroll = min(g_fsInfoScroll + 1,
+                                              FILESYNC_INFO_LINE_COUNT - 3);
+        if (backPressed) g_state = STATE_FILESYNC_MENU;
+        break;
 
     default: break;
     }

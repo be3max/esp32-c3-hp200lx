@@ -202,7 +202,50 @@ Access via: hold both buttons → **Programs**
 | **Car Game** | Physics-based car driving. OK = throttle forward, BACK = reverse. Terrain is procedurally generated with increasing difficulty. Wheelie/flip = crash. Distance is the score. |
 | **3D Racing** | Pseudo-3D perspective racer. BACK = steer left, OK = steer right. 3 lanes, curved road, roadside scenery. Score = opponents overtaken. Hi-score saved to NVS. |
 | **KBD Driver** | XMODEM file transfer tool — see above. |
+| **File Sync** | WiFi file manager for the HP 200LX filesystem — see below. |
 | *(LittleFS files)* | Any `.COM`/`.EXE`/other files in `data/` appear here (not yet launched — future feature). |
+
+---
+
+## File Sync (browse HP 200LX files over WiFi)
+
+Manage the HP 200LX filesystem from a phone or PC browser — list, download,
+upload, delete, rename, and create/remove folders. The ESP32 bridges your WiFi
+to the HP 200LX serial link by speaking the **Kermit** protocol to MS-Kermit
+running in server mode; no custom DOS program is required.
+
+> Because the ESP32-C3 shares one radio between BLE and WiFi, File Sync reboots
+> into a WiFi-only mode (like Settings). The BLE keyboard bridge is **not**
+> active while syncing. Press **BACK** (or hold both buttons) to reboot back to
+> normal keyboard mode.
+
+**On the HP 200LX (one-time per session):**
+
+1. Connect the serial cable (MAX3232 → COM1) as for keyboard use.
+2. At the DOS prompt run Kermit and put it in server mode:
+   ```
+   kermit
+   SET PORT COM1
+   SET SPEED 9600
+   SET FLOW NONE
+   SET FILE TYPE BINARY
+   SERVER
+   ```
+   (You can drop `kermit.exe` plus a `KERMSRV.BAT` shortcut onto the HP using
+   the **KBD Driver** XMODEM transfer.)
+
+**On the ESP32:**
+
+1. Make sure WiFi credentials are saved (**Settings** → Save). With no creds,
+   File Sync bounces you into the Settings AP first.
+2. Hold both buttons → **Programs → File Sync**. The device reboots, joins your
+   WiFi, and the OLED shows the URL + a QR code.
+3. Open `http://<ip>` in a browser. Browse folders, **get**/**ren**/**del**
+   files, **Upload**, and create/remove folders.
+
+Notes: the link is 9600 baud (~960 B/s) so transfers are slow; one operation
+runs at a time. Uploads are spooled through LittleFS, so upload size is capped
+by free flash. Use DOS 8.3 names.
 
 ---
 
